@@ -1,13 +1,75 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use k8s_openapi::serde::Deserialize;
 use kube::api::DynamicObject;
 use serde_yml::Deserializer;
 use std::{path::PathBuf, rc::Rc};
 
+use crate::Cli;
+
 #[derive(Debug, Clone)]
-struct SystemManifests {
+pub struct SystemManifests {
     directory: PathBuf,
     platforms: Vec<Platform>,
+}
+
+fn validate_directories_exist(directories: &[&PathBuf]) -> Result<()> {
+    for dir in directories {
+        if let Ok(metadata) = std::fs::metadata(dir) {
+            if !metadata.is_dir() {
+                anyhow::bail!("Path exists but is not a directory: {}", dir.display());
+            }
+        } else {
+            anyhow::bail!("Directory does not exist: {}", dir.display());
+        }
+    }
+    Ok(())
+}
+
+fn get_cluster_names_from_clusters_directories(
+    clusters_directory: &PathBuf,
+) -> Result<Vec<String>> {
+    let mut platforms = Vec::new();
+
+    let entries = std::fs::read_dir(clusters_directory).with_context(|| {
+        format!(
+            "Failed to read clusters directory to discover platforms: {}",
+            clusters_directory.display()
+        )
+    })?;
+
+    for entry in entries {
+        let entry = entry.with_context(|| "Failed to read a platform directory")?;
+        let path = entry.path();
+
+        if path.is_dir() {
+            platforms.push(
+                path.file_stem()
+                    .map(|os_string| os_string.to_str())
+                    .flatten()
+                    .with_context(|| "Failed to read a platform directory name")?
+                    .to_owned(),
+            );
+        }
+    }
+
+    Ok(platforms)
+}
+
+impl SystemManifests {
+    pub fn new(cli: &Cli) -> Result<Self> {
+        let directory: PathBuf = cli.system_manifests.clone().into();
+        let clusters_directory = directory.join("clusters");
+        validate_directories_exist(&[&clusters_directory])
+            .with_context(|| "Failed to obtain clusters directory")?;
+        let platforms = get_cluster_names_from_clusters_directories(&clusters_directory)?
+            .into_iter()
+            .map(|name| Platform::new(name, directory.clone()))
+            .collect::<Result<_>>()?;
+        Ok(SystemManifests {
+            directory,
+            platforms,
+        })
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -17,6 +79,72 @@ struct Platform {
     cluster_directory: PathBuf,
     manifests_directory: PathBuf,
     components: Vec<Rc<Component>>,
+}
+
+fn get_component_names_from_cluster_yaml_files(cluster_directory: &PathBuf) -> Result<Vec<String>> {
+    let mut components = Vec::new();
+
+    let entries = std::fs::read_dir(cluster_directory).with_context(|| {
+        format!(
+            "Failed to read cluster directory to discover components: {}",
+            cluster_directory.display()
+        )
+    })?;
+
+    for entry in entries {
+        let entry = entry.with_context(|| "Failed to read a components kustomization file")?;
+        let path = entry.path();
+
+        if !path.is_dir() && path.extension().map(|ext| ext == "yaml").unwrap_or(false) {
+            components.push(
+                path.file_stem()
+                    .map(|os_string| os_string.to_str())
+                    .flatten()
+                    .with_context(|| "Failed to read a components kustomization file")?
+                    .to_owned(),
+            );
+        }
+    }
+
+    Ok(components)
+}
+
+impl Platform {
+    pub fn new(name: String, system_manifest_directory: PathBuf) -> Result<Self> {
+        let environment_directory = system_manifest_directory
+            .join("environments")
+            .join(name.clone());
+        let cluster_directory = system_manifest_directory
+            .join("clusters")
+            .join(name.clone());
+        let manifests_directory = system_manifest_directory
+            .join("manifests")
+            .join(name.clone());
+        validate_directories_exist(&[
+            &environment_directory,
+            &cluster_directory,
+            &manifests_directory,
+        ]).with_context(|| "Failed to obtain platform directories")?;
+        let components: Vec<Rc<Component>> =
+            get_component_names_from_cluster_yaml_files(&cluster_directory)?
+                .into_iter()
+                .map(|name| {
+                    let component_manifests_directory = manifests_directory.join(name.clone());
+                    validate_directories_exist(&[&component_manifests_directory]).with_context(|| "Failed to obtain component manifest directory")?;
+                    Ok(Rc::new(Component {
+                        name,
+                        manifests_directory: component_manifests_directory,
+                    }))
+                })
+                .collect::<Result<_>>()?;
+        Ok(Platform {
+            name,
+            environment_directory,
+            cluster_directory,
+            manifests_directory,
+            components,
+        })
+    }
 }
 
 #[derive(Debug, Clone)]
