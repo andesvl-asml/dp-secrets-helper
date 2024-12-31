@@ -1,15 +1,15 @@
 use anyhow::{Context, Result};
-use k8s_openapi::serde::Deserialize;
-use kube::api::DynamicObject;
-use serde_yml::Deserializer;
+use k8s_openapi::serde::{Deserialize, Serialize};
+use kube::api::{DynamicObject, ObjectMeta};
+use serde_yaml::Deserializer;
 use std::{path::PathBuf, rc::Rc};
 
 use crate::Cli;
 
 #[derive(Debug, Clone)]
 pub struct SystemManifests {
-    directory: PathBuf,
-    platforms: Vec<Platform>,
+    pub directory: PathBuf,
+    pub platforms: Vec<Rc<Platform>>,
 }
 
 fn validate_directories_exist(directories: &[&PathBuf]) -> Result<()> {
@@ -63,7 +63,7 @@ impl SystemManifests {
             .with_context(|| "Failed to obtain clusters directory")?;
         let platforms = get_cluster_names_from_clusters_directories(&clusters_directory)?
             .into_iter()
-            .map(|name| Platform::new(name, directory.clone()))
+            .map(|name| Platform::new(name, directory.clone()).map(Rc::new))
             .collect::<Result<_>>()?;
         Ok(SystemManifests {
             directory,
@@ -72,35 +72,68 @@ impl SystemManifests {
     }
 }
 
-#[derive(Debug, Clone)]
-struct Platform {
-    name: String,
-    environment_directory: PathBuf,
-    cluster_directory: PathBuf,
-    manifests_directory: PathBuf,
-    components: Vec<Rc<Component>>,
+impl<'a> SystemManifests {
+    pub fn resource_iter(&'a self) -> SystemManifestsResourceIterator<'a> {
+        SystemManifestsResourceIterator::new(self)
+    }
 }
 
-fn get_component_names_from_cluster_yaml_files(cluster_directory: &PathBuf) -> Result<Vec<String>> {
+pub struct SystemManifestsResourceIterator<'a> {
+    resource_iterator: Box<dyn Iterator<Item = anyhow::Result<ManifestResource>> + 'a>,
+}
+
+impl<'a> SystemManifestsResourceIterator<'a> {
+    fn new(system_manifests: &'a SystemManifests) -> Self {
+        let resource_iterator = system_manifests
+            .platforms
+            .iter()
+            .flat_map(|p| p.resource_iter());
+
+        SystemManifestsResourceIterator {
+            resource_iterator: Box::new(resource_iterator),
+        }
+    }
+}
+
+impl<'a> Iterator for SystemManifestsResourceIterator<'a> {
+    type Item = Result<ManifestResource>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.resource_iterator.next()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Platform {
+    pub name: String,
+    pub environment_directory: PathBuf,
+    pub cluster_directory: PathBuf,
+    pub manifests_directory: PathBuf,
+    pub components: Vec<Rc<Component>>,
+}
+
+fn get_component_names_from_manifest_directory(
+    platform_manifests_directory: &PathBuf,
+) -> Result<Vec<String>> {
     let mut components = Vec::new();
 
-    let entries = std::fs::read_dir(cluster_directory).with_context(|| {
+    let entries = std::fs::read_dir(platform_manifests_directory).with_context(|| {
         format!(
-            "Failed to read cluster directory to discover components: {}",
-            cluster_directory.display()
+            "Failed to read platform manifests directory to discover components: {}",
+            platform_manifests_directory.display()
         )
     })?;
 
     for entry in entries {
-        let entry = entry.with_context(|| "Failed to read a components kustomization file")?;
+        let entry = entry.with_context(|| "Failed to read the manifest directory")?;
         let path = entry.path();
 
-        if !path.is_dir() && path.extension().map(|ext| ext == "yaml").unwrap_or(false) {
+        if path.is_dir() {
             components.push(
                 path.file_stem()
                     .map(|os_string| os_string.to_str())
                     .flatten()
-                    .with_context(|| "Failed to read a components kustomization file")?
+                    .with_context(|| "Failed to read a component manifest directory")?
                     .to_owned(),
             );
         }
@@ -124,13 +157,15 @@ impl Platform {
             &environment_directory,
             &cluster_directory,
             &manifests_directory,
-        ]).with_context(|| "Failed to obtain platform directories")?;
+        ])
+        .with_context(|| "Failed to obtain platform directories")?;
         let components: Vec<Rc<Component>> =
-            get_component_names_from_cluster_yaml_files(&cluster_directory)?
+            get_component_names_from_manifest_directory(&manifests_directory)?
                 .into_iter()
                 .map(|name| {
                     let component_manifests_directory = manifests_directory.join(name.clone());
-                    validate_directories_exist(&[&component_manifests_directory]).with_context(|| "Failed to obtain component manifest directory")?;
+                    validate_directories_exist(&[&component_manifests_directory])
+                        .with_context(|| "Failed to obtain component manifest directory")?;
                     Ok(Rc::new(Component {
                         name,
                         manifests_directory: component_manifests_directory,
@@ -145,23 +180,46 @@ impl Platform {
             components,
         })
     }
+
+    fn resource_iter(self: &Rc<Self>) -> PlatformResourceIterator {
+        PlatformResourceIterator::new(self)
+    }
 }
 
 #[derive(Debug, Clone)]
-struct Component {
-    manifests_directory: PathBuf,
-    name: String,
+pub struct Component {
+    pub manifests_directory: PathBuf,
+    pub name: String,
 }
 
 #[derive(Clone)]
-struct ManifestResource {
-    file: PathBuf,
-    component: Rc<Component>,
-    platform: Rc<Platform>,
-    resource: DynamicObject,
+pub struct ManifestResource {
+    pub file: PathBuf,
+    pub component: Rc<Component>,
+    pub platform: Rc<Platform>,
+    pub resource: DynamicObject,
 }
 
-struct PlatformResourceIterator<'a> {
+#[derive(Debug, Clone, Serialize)]
+pub struct FlatManifestResource {
+    pub file: PathBuf,
+    pub component_name: String,
+    pub platform_name: String,
+    pub resource_meta: kube::core::ObjectMeta,
+}
+
+impl From<ManifestResource> for FlatManifestResource {
+    fn from(value: ManifestResource) -> Self {
+        FlatManifestResource {
+            file: value.file.clone(),
+            component_name: value.component.name.clone(),
+            platform_name: value.platform.name.clone(),
+            resource_meta: value.resource.metadata,
+        }
+    }
+}
+
+pub struct PlatformResourceIterator<'a> {
     platform: Rc<Platform>,
     resource_iterator: Box<dyn Iterator<Item = anyhow::Result<ManifestResource>> + 'a>,
 }
