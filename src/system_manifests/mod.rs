@@ -231,9 +231,7 @@ impl<'a> PlatformResourceIterator<'a> {
         let resource_iterator = platform
             .components
             .iter()
-            .cloned()
-            .to_owned()
-            .flat_map(|c: Rc<Component>| {
+            .flat_map(|c: &Rc<Component>| {
                 std::fs::read_dir(&c.manifests_directory)
                     .into_iter()
                     .flat_map(move |rd| {
